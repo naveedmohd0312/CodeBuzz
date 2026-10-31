@@ -80,6 +80,15 @@ def test_question_validator_rejects_cross_collection_overlap_and_example_mismatc
                           languages={"python": {"id": 71, "label": "Python 3"}})
 
 
+def test_question_validator_derives_missing_example_from_public_case_only():
+    raw = valid_payload()
+    raw["examples"] = []
+    validated = validate_question(raw, topic="Arrays", difficulty="easy", level=1,
+                                  languages={"python": {"id": 71, "label": "Python 3"}})
+    assert validated["examples"][0]["input"] == validated["public_test_cases"][0]["input"]
+    assert validated["examples"][0]["output"] == validated["public_test_cases"][0]["output"]
+
+
 @pytest.mark.parametrize("level", [1, 2, 3, 4])
 def test_hint_levels_are_supported_and_bounded(level, monkeypatch):
     captured = {}

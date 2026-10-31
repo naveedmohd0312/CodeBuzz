@@ -10,7 +10,9 @@ from coding_ai_provider import CodingAIError, CodingAIProviderError, request_cod
 
 
 class CodingQuestionError(RuntimeError):
-    pass
+    def __init__(self, message, reason=None):
+        super().__init__(message)
+        self.reason = reason
 
 
 def _clean_string(value, label, minimum=1, maximum=8000):
@@ -58,16 +60,25 @@ def validate_question(raw, *, topic, difficulty, level, languages, previous=()):
         raise ValueError("Supported language metadata does not match the configured candidate languages.")
     title = _clean_string(raw.get("title"), "Title", 5, 160)
     statement = _clean_string(raw.get("problem_statement"), "Problem statement", 20, 8000)
+    public_cases = _validate_cases(raw.get("public_test_cases"), "public_test_cases", 2, 5)
+    hidden_cases = _validate_cases(raw.get("hidden_test_cases"), "hidden_test_cases", 4, 15)
+    raw_examples = raw.get("examples")
+    if raw_examples is None or raw_examples == []:
+        # Some models omit the example section. Build a sample only from an
+        # already supplied public case; never fabricate an input or expected output.
+        examples = [{"input": public_cases[0]["input"], "output": public_cases[0]["output"],
+                     "explanation": "This public test case illustrates the input and output format."}]
+    else:
+        examples = _validate_cases(raw_examples, "examples", 1, 3)
     data = {
         "title": title, "problem_statement": statement,
         "problem_description": _clean_string(raw.get("problem_description"), "Problem description", 12, 5000),
         "input_format": _clean_string(raw.get("input_format"), "Input format", 4, 2000),
         "output_format": _clean_string(raw.get("output_format"), "Output format", 4, 2000),
-        "constraints": raw.get("constraints"), "examples": _validate_cases(raw.get("examples"), "examples", 1, 3),
+        "constraints": raw.get("constraints"), "examples": examples,
         "topic": topic, "difficulty": difficulty, "level": level,
         "supported_languages": sorted(languages), "starter_code": raw.get("starter_code"),
-        "public_test_cases": _validate_cases(raw.get("public_test_cases"), "public_test_cases", 2, 5),
-        "hidden_test_cases": _validate_cases(raw.get("hidden_test_cases"), "hidden_test_cases", 4, 15),
+        "public_test_cases": public_cases, "hidden_test_cases": hidden_cases,
         "reference_solution": _clean_string(raw.get("reference_solution"), "Reference solution", 20, 20000),
         "expected_time_complexity": _clean_string(raw.get("expected_time_complexity"), "Time complexity", 2, 200),
         "expected_space_complexity": _clean_string(raw.get("expected_space_complexity"), "Space complexity", 2, 200),
@@ -113,12 +124,13 @@ def _prompt(portfolio, topic, difficulty, level, languages, previous, reference_
         f"Write reference_solution in the configured {reference_language} language. "
         f"Avoid these previous question title/problem fragments: {json.dumps(list(previous)[-30:], ensure_ascii=False)}. "
         "Return only JSON with: title, problem_statement, problem_description, input_format, output_format, "
-        "constraints (string array), examples (1-3 objects with input/output/explanation), topic, difficulty, level, "
+        "constraints (string array), exactly 1 example object with input/output/explanation, topic, difficulty, level, "
         "supported_languages (array containing every configured language identifier), "
-        "starter_code (object with an entry for every supported language), public_test_cases (2-5 input/output objects), "
-        "hidden_test_cases (4-15 input/output objects), reference_solution (complete program in the requested reference language reading stdin), "
+        "starter_code (object with an entry for every supported language), exactly 2 public_test_cases objects, "
+        "exactly 4 hidden_test_cases objects, each with input and output strings, "
+        "reference_solution (complete program in the requested reference language reading stdin), "
         "expected_time_complexity, expected_space_complexity. Ensure every example is also a public test. "
-        "Specify exact output format and produce a reference solution that satisfies every test. No markdown fences.")
+        "Keep test inputs concise but distinct across public and hidden cases. Specify exact output format and produce a reference solution that satisfies every test. No markdown fences.")
 
 
 def generate_coding_question(portfolio, topic, difficulty, level, previous=(), languages=None):
@@ -135,7 +147,7 @@ def generate_coding_question(portfolio, topic, difficulty, level, previous=(), l
         {"role": "user", "content": _prompt(portfolio, topic, difficulty, level, languages, previous, reference_language)},
     ]
     last_problem = ""
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             raw = request_coding_provider_json(messages, max_tokens=7000)
             question = validate_question(raw, topic=topic, difficulty=difficulty, level=level,
@@ -162,12 +174,15 @@ def generate_coding_question(portfolio, topic, difficulty, level, previous=(), l
             raise CodingQuestionError("The question provider is temporarily unavailable. Please retry.") from exc
         except (ValueError, CodingAIError, RunnerError) as exc:
             last_problem = str(exc)[:240]
-            if attempt == 0:
+            if attempt < 2:
                 messages.append({"role": "assistant", "content": "The previous question failed validation."})
                 messages.append({"role": "user", "content": f"Regenerate the complete question and fix this issue: {last_problem}. Return valid JSON only."})
                 if isinstance(exc, RunnerError) and exc.status == 503:
                     raise CodingQuestionError(str(exc)) from exc
-    raise CodingQuestionError("Question generation could not produce a valid, tested problem. Please retry.")
+    raise CodingQuestionError(
+        "Question generation could not produce a valid, tested problem. "
+        f"Last check failed: {last_problem or 'unknown validation issue'}. Please retry.",
+        reason=last_problem or "unknown validation issue")
 
 
 def get_hint(question, language, hint_level, code="", previous_hints=()):

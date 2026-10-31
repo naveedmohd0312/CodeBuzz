@@ -25,7 +25,6 @@ BACKEND_DIR = Path(__file__).resolve().parent
 load_dotenv(BACKEND_DIR / ".env")
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
@@ -33,7 +32,6 @@ from mcq_service import MCQGenerationError, MCQProviderError, generate_mcqs
 from coding_runner import RunnerError, configured_languages, execute, run_cases
 from coding_service import CodingQuestionError, generate_coding_question, get_hint
 from project_interview_service import (configured_rules as project_interview_rules,
-                                       ProjectAIError,
                                        evaluate_answer as evaluate_project_answer,
                                        generate_question as generate_project_question,
                                        next_difficulty as next_project_difficulty)
@@ -225,21 +223,6 @@ class CodingQuestion(db.Model):
     )
 
 
-class CodingDraft(db.Model):
-    """Private, versioned candidate code saved per question and language."""
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id", ondelete="CASCADE"), nullable=False, index=True)
-    question_id = db.Column(db.Integer, db.ForeignKey("coding_question.id", ondelete="CASCADE"), nullable=False, index=True)
-    language = db.Column(db.String(40), nullable=False)
-    source_code = db.Column(db.Text, nullable=False)
-    revision = db.Column(db.Integer, nullable=False, default=0)
-    updated_at = db.Column(db.DateTime, nullable=False, default=utcnow, onupdate=utcnow)
-    __table_args__ = (
-        db.UniqueConstraint("user_id", "question_id", "language", name="uq_coding_draft_owner_question_language"),
-        db.CheckConstraint("revision >= 0", name="ck_coding_draft_revision"),
-    )
-
-
 class CandidateCodingProgress(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -379,25 +362,6 @@ class ProjectInterviewTransition(db.Model):
 
 def response_error(message, status):
     return jsonify({"ok": False, "error": message}), status
-
-
-def upgrade_existing_sqlite_schema(engine):
-    """Apply small additive upgrades that SQLAlchemy create_all does not perform."""
-    if engine.dialect.name != "sqlite":
-        return
-    upgrades = {"project_interview_answer": {"evaluation_started_at": "DATETIME"}}
-    with engine.begin() as connection:
-        inspector = inspect(connection)
-        tables = set(inspector.get_table_names())
-        for table_name, columns in upgrades.items():
-            if table_name not in tables:
-                continue
-            existing = {column["name"] for column in inspector.get_columns(table_name)}
-            for column_name, column_type in columns.items():
-                if column_name not in existing:
-                    connection.exec_driver_sql(
-                        f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {column_type}')
-                    existing.add(column_name)
 
 
 def csrf_token():
@@ -1304,280 +1268,6 @@ def candidate_performance(user):
             "scoring_policy": "MCQ and coding average the best attempt per level; project score averages the best completed interview per selected project. Repeated attempts do not add weight. Overall score uses configured weights and is final only when all three pipelines have a score."}
 
 
-def performance_dashboard_data(user, saved_performance=None):
-    """Build the personal performance view strictly from persisted assessment records."""
-    mcq_rows = AssessmentResult.query.filter_by(user_id=user.id).all()
-    coding_rows = CodingSubmission.query.filter_by(user_id=user.id).all()
-    project_rows = ProjectInterviewSession.query.filter_by(user_id=user.id).all()
-    weights = configured_score_weights()
-
-    events = []
-    topic_observations = {}
-
-    def add_topic_observation(topic, score, event_time, source):
-        if not isinstance(topic, str) or not topic.strip() or score is None:
-            return
-        topic_observations.setdefault(topic.strip(), []).append({
-            "score": float(score), "date": event_time.isoformat() if event_time else None,
-            "source": source,
-        })
-
-    for result in mcq_rows:
-        assessment = result.assessment
-        completed = result.completed_at or (assessment.submitted_at if assessment else None)
-        duration = None
-        if assessment and assessment.started_at and completed:
-            duration = max(0, int((completed - assessment.started_at).total_seconds()))
-        answer_map = {answer.question_id: answer for answer in assessment.answers} if assessment else {}
-        topic_stats = {}
-        for question in (assessment.questions if assessment else []):
-            stats = topic_stats.setdefault(question.topic, {"correct": 0, "total": 0})
-            stats["total"] += 1
-            candidate_answer = answer_map.get(question.id)
-            if candidate_answer and candidate_answer.selected_answer == question.correct_answer:
-                stats["correct"] += 1
-        for topic, stats in topic_stats.items():
-            accuracy = round(stats["correct"] / stats["total"] * 100, 2) if stats["total"] else None
-            add_topic_observation(topic, accuracy, completed, "mcq")
-        events.append({"id": f"mcq-{result.id}", "pipeline": "mcq", "name": f"MCQ · {result.difficulty.title()} Level {result.level}",
-            "date": completed.isoformat() if completed else None, "sort_date": completed,
-            "score": result.score_percentage, "status": "Passed" if result.passed else "Not passed",
-            "duration_seconds": duration, "questions": result.total_questions,
-            "correct": result.correct_answers, "details_path": f"/api/mcq/result/{result.assessment_id}",
-            "unit": f"{result.difficulty}:{result.level}"})
-
-    for row in coding_rows:
-        question = row.question
-        title = (question.content or {}).get("title", "Coding problem") if question else "Coding problem"
-        topic = question.topic if question else "Coding"
-        difficulty = question.difficulty if question else ""
-        level = question.level if question else 0
-        if row.score_percentage is not None:
-            add_topic_observation(topic, row.score_percentage, row.submitted_at, "coding")
-        events.append({"id": f"coding-{row.id}", "pipeline": "coding", "name": str(title),
-            "date": row.submitted_at.isoformat() if row.submitted_at else None, "sort_date": row.submitted_at,
-            "score": row.score_percentage, "status": ("Passed" if row.passed else "Not passed") if row.score_percentage is not None else "Execution error",
-            "duration_seconds": None, "execution_time_ms": row.execution_time_ms,
-            "test_cases_passed": row.passed_test_cases, "test_cases_total": row.total_test_cases,
-            "details_path": f"/api/coding/submission/{row.id}", "topic": topic,
-            "unit": f"{difficulty}:{topic}:{level}"})
-
-    for row in project_rows:
-        completed = row.completed_at
-        duration = max(0, int((completed - row.started_at).total_seconds())) if completed and row.started_at else None
-        report = row.final_report or {}
-        for topic, value in report.get("topic_performance", {}).items():
-            add_topic_observation(topic, value.get("average_score"), completed, "project")
-        events.append({"id": f"project-{row.id}", "pipeline": "project", "name": f"Project interview · {row.project_name}",
-            "date": (completed or row.started_at).isoformat() if (completed or row.started_at) else None,
-            "sort_date": completed or row.started_at, "score": row.final_score,
-            "status": "Completed" if row.status == "completed" else "In progress",
-            "duration_seconds": duration, "questions": report.get("question_count"),
-            "details_path": f"/api/project-interview/session/{row.id}/report" if row.status == "completed" else f"/api/project-interview/session/{row.id}",
-            "unit": row.project_key})
-
-    events.sort(key=lambda item: (item["sort_date"] is not None, item["sort_date"] or datetime.min, item["id"]))
-    best = {"mcq": {}, "coding": {}, "project": {}}
-    trend = []
-    current_scores = {"mcq": None, "coding": None, "project": None}
-    for event in events:
-        pipeline, score = event["pipeline"], event["score"]
-        if score is not None:
-            prior = best[pipeline].get(event["unit"])
-            if prior is None or score > prior:
-                best[pipeline][event["unit"]] = float(score)
-                current_scores[pipeline] = round(sum(best[pipeline].values()) / len(best[pipeline]), 2)
-        if score is not None and event["date"] and any(value is not None for value in current_scores.values()):
-            available = [name for name, value in current_scores.items() if value is not None]
-            denominator = sum(weights[name] for name in available)
-            overall = round(sum(current_scores[name] * weights[name] for name in available) / denominator, 2)
-            trend.append({"date": event["date"], "mcq": current_scores["mcq"],
-                          "coding": current_scores["coding"], "project": current_scores["project"],
-                          "overall": overall, "event_id": event["id"]})
-
-    # Skill scores use best records for repeated assessment units, matching the platform score policy.
-    skill_units = {}
-    mcq_best = {}
-    for result in mcq_rows:
-        unit = (result.difficulty, result.level)
-        if unit not in mcq_best or result.score_percentage > mcq_best[unit].score_percentage:
-            mcq_best[unit] = result
-    for result in mcq_best.values():
-        assessment = result.assessment
-        answers = {answer.question_id: answer for answer in assessment.answers} if assessment else {}
-        grouped = {}
-        for question in (assessment.questions if assessment else []):
-            item = grouped.setdefault(question.topic, {"correct": 0, "total": 0})
-            item["total"] += 1
-            answer = answers.get(question.id)
-            if answer and answer.selected_answer == question.correct_answer:
-                item["correct"] += 1
-        for topic, counts in grouped.items():
-            score = counts["correct"] / counts["total"] * 100 if counts["total"] else 0
-            skill_units.setdefault(topic, []).append({"unit": f"mcq:{result.difficulty}:{result.level}",
-                "score": score, "weight": counts["total"], "source": "mcq"})
-
-    coding_best = {}
-    for row in coding_rows:
-        if row.score_percentage is None or not row.question:
-            continue
-        key = (row.question.difficulty, row.question.topic, row.question.level)
-        if key not in coding_best or row.score_percentage > coding_best[key].score_percentage:
-            coding_best[key] = row
-    for row in coding_best.values():
-        skill_units.setdefault(row.question.topic, []).append({"unit": f"coding:{row.question.difficulty}:{row.question.topic}:{row.question.level}",
-            "score": row.score_percentage, "weight": 1, "source": "coding"})
-
-    project_best = {}
-    for row in project_rows:
-        if row.status == "completed" and row.final_score is not None and (
-                row.project_key not in project_best or row.final_score > project_best[row.project_key].final_score):
-            project_best[row.project_key] = row
-    for row in project_best.values():
-        for topic, value in (row.final_report or {}).get("topic_performance", {}).items():
-            skill_units.setdefault(topic, []).append({"unit": f"project:{row.project_key}:{topic}",
-                "score": value.get("average_score", 0), "weight": max(1, value.get("questions", 1)), "source": "project"})
-
-    portfolio = user.portfolio
-    languages = {value.casefold() for value in (portfolio.programming_languages or []) if isinstance(value, str)} if portfolio else set()
-    dsa = {value.casefold() for value in (portfolio.dsa_topics or []) if isinstance(value, str)} if portfolio else set()
-    techs = {value.casefold() for value in ((portfolio.technologies or []) + (portfolio.skills or [])) if isinstance(value, str)} if portfolio else set()
-    database_terms = {"sql", "sqlite", "sqlite3", "postgresql", "postgres", "mysql", "mariadb", "mongodb", "redis", "dynamodb", "firebase", "supabase", "oracle"}
-    def categorize(topic, sources):
-        norm = topic.casefold()
-        if norm in languages or any(language in norm for language in languages): return "Programming languages"
-        if norm in dsa or any(term in norm for term in ("array", "string", "sorting", "search", "tree", "graph", "dynamic programming", "linked list", "stack", "queue", "dsa")): return "DSA"
-        if any(term in norm for term in database_terms) or any(term in norm for term in ("database", "query", "sql", "normalization", "relational")): return "SQL & databases"
-        if any(term in norm for term in ("react", "frontend", "front-end", "web", "html", "css", "javascript")): return "Web development"
-        if any(term in norm for term in ("backend", "back-end", "api", "server", "flask", "django", "express", "authentication")): return "Backend development"
-        if "project" in sources: return "Project implementation"
-        if "mcq" in sources: return "Technical fundamentals"
-        return None
-
-    skills = []
-    for topic, units in skill_units.items():
-        numerator = sum(row["score"] * row["weight"] for row in units)
-        denominator = sum(row["weight"] for row in units)
-        score = round(numerator / denominator, 2) if denominator else None
-        observations = sorted(topic_observations.get(topic, []), key=lambda row: row["date"] or "")
-        change = round(observations[-1]["score"] - observations[0]["score"], 2) if len(observations) > 1 else None
-        sources = sorted({row["source"] for row in units})
-        category = categorize(topic, sources)
-        if not category:
-            continue
-        if score is not None and score >= 80:
-            status = "Strong"
-        elif change is not None and change >= 5:
-            status = "Improving"
-        elif score is not None and score < 65:
-            status = "Needs improvement"
-        else:
-            status = "Steady"
-        recommendation = None
-        if status == "Needs improvement":
-            if "project" in sources:
-                recommendation = f"In a future interview, explain the implementation details and trade-offs you left unclear for {topic}."
-            elif "coding" in sources:
-                recommendation = f"Practice another {topic} problem and focus on the cases missed in your saved attempts."
-            else:
-                recommendation = f"Review the {topic} questions you missed, then retry a related MCQ level."
-        skills.append({"name": topic, "category": category, "score": score, "change": change,
-            "status": status, "evidence_count": sum(row["weight"] for row in units),
-            "sources": sources, "recommendation": recommendation})
-    skills.sort(key=lambda item: (item["score"] if item["score"] is not None else -1, item["name"].casefold()))
-    categories = []
-    for category in ("Programming languages", "DSA", "SQL & databases", "Web development",
-                     "Backend development", "Project implementation", "Technical fundamentals"):
-        rows = [row for row in skills if row["category"] == category]
-        if rows:
-            weight = sum(row["evidence_count"] for row in rows)
-            categories.append({"name": category,
-                "score": round(sum(row["score"] * row["evidence_count"] for row in rows) / weight, 2) if weight else None,
-                "evidence_count": weight, "skills": rows})
-
-    mcq_questions = sum(row.correct_answers + row.incorrect_answers for row in mcq_rows)
-    mcq_correct = sum(row.correct_answers for row in mcq_rows)
-    mcq_scores = sorted([row for row in events if row["pipeline"] == "mcq" and row["score"] is not None], key=lambda item: item["sort_date"] or datetime.min)
-    mcq_trend = round(mcq_scores[-1]["score"] - mcq_scores[0]["score"], 2) if len(mcq_scores) > 1 else None
-    coding_valid = [row for row in coding_rows if row.score_percentage is not None]
-    coding_best_question = {}
-    for row in coding_valid:
-        if row.question_id not in coding_best_question or row.score_percentage > coding_best_question[row.question_id].score_percentage:
-            coding_best_question[row.question_id] = row
-    runtime_rows = [row.execution_time_ms for row in coding_best_question.values() if row.execution_time_ms is not None]
-    coding_tests_passed = sum(row.passed_test_cases for row in coding_valid)
-    coding_tests_total = sum(row.total_test_cases for row in coding_valid)
-    completed_projects = [row for row in project_rows if row.status == "completed" and row.final_score is not None]
-    project_questions = sum((row.final_report or {}).get("question_count", 0) for row in completed_projects)
-    project_by_time = sorted(completed_projects, key=lambda row: row.completed_at or datetime.min)
-    project_trend = round(project_by_time[-1].final_score - project_by_time[0].final_score, 2) if len(project_by_time) > 1 else None
-    timed_durations = [event["duration_seconds"] for event in events if event["duration_seconds"] is not None and event["pipeline"] in {"mcq", "project"}]
-    timed_total = sum(timed_durations)
-
-    completed_events = [event for event in events if event["score"] is not None]
-    latest_overall = trend[-1]["overall"] if trend else None
-    previous_overall = trend[-2]["overall"] if len(trend) > 1 else None
-    improvement_points = round(latest_overall - previous_overall, 2) if latest_overall is not None and previous_overall is not None else None
-    improvement_percentage = round((latest_overall - previous_overall) / previous_overall * 100, 2) if previous_overall and latest_overall is not None else None
-    completed_count = len(mcq_rows) + len(coding_valid) + len(completed_projects)
-    if latest_overall is None:
-        performance_level = None
-    elif latest_overall >= 80:
-        performance_level = "Advanced"
-    elif latest_overall >= 60:
-        performance_level = "Intermediate"
-    else:
-        performance_level = "Beginner"
-
-    milestones = []
-    if completed_events:
-        first, last = completed_events[0], completed_events[-1]
-        milestones.append({"date": first["date"], "title": "First recorded assessment", "detail": first["name"], "kind": "start"})
-        if len(completed_events) > 1:
-            milestones.append({"date": last["date"], "title": "Latest recorded assessment", "detail": f"{last['name']} · {last['score']}%", "kind": "latest"})
-    for row in mcq_rows:
-        if row.passed:
-            milestones.append({"date": row.completed_at.isoformat(), "title": f"Passed MCQ {row.difficulty.title()} Level {row.level}", "detail": f"{row.score_percentage}%", "kind": "passed"})
-    for row in coding_valid:
-        if row.passed:
-            milestones.append({"date": row.submitted_at.isoformat(), "title": f"Passed coding problem: {row.question.content.get('title', 'Coding problem')}", "detail": f"{row.score_percentage}% · {row.passed_test_cases}/{row.total_test_cases} tests", "kind": "passed"})
-    improved_skills = [row for row in skills if row["change"] is not None and row["change"] > 0]
-    for row in sorted(improved_skills, key=lambda item: item["change"], reverse=True)[:5]:
-        observations = sorted(topic_observations.get(row["name"], []), key=lambda item: item["date"] or "")
-        milestones.append({"date": (observations or [{}])[-1].get("date"),
-            "title": f"Improved in {row['name']}", "detail": f"+{row['change']} percentage points across recorded attempts", "kind": "improvement"})
-    milestones.sort(key=lambda row: row["date"] or "")
-
-    serial_history = [{key: value for key, value in event.items() if key != "sort_date"} for event in sorted(events,
-        key=lambda item: (item["sort_date"] is not None, item["sort_date"] or datetime.min), reverse=True)[:100]]
-    latest_completed_date = max((event["sort_date"] for event in completed_events if event["sort_date"]), default=None)
-    saved_performance = saved_performance or candidate_performance(user)
-    all_pipelines_complete = all(saved_performance["scores"].get(key) is not None for key in ("mcq", "coding", "project"))
-    return {"overview": {"overall_score": latest_overall, "provisional": bool(latest_overall is not None and not all_pipelines_complete),
-        "assessments_completed": completed_count, "time_spent_seconds": timed_total,
-        "timed_assessment_count": len(timed_durations), "time_note": "Measured duration includes MCQ and completed project interviews. Coding wall time is not stored; coding execution runtime is shown separately.",
-        "performance_level": performance_level, "improvement_percentage": improvement_percentage,
-        "improvement_points": improvement_points, "latest_assessment_at": latest_completed_date.isoformat() if latest_completed_date else None},
-        "trend": trend, "skills": skills, "categories": categories,
-        "strengths": [row for row in reversed(skills) if row["status"] == "Strong"][:5],
-        "weaknesses": [row for row in skills if row["status"] == "Needs improvement"][:5],
-        "category_performance": {
-            "mcq": {"attempts": len(mcq_rows), "questions_attempted": mcq_questions, "correct": mcq_correct,
-                "accuracy": round(mcq_correct / mcq_questions * 100, 2) if mcq_questions else None, "improvement_points": mcq_trend},
-            "coding": {"attempts": len(coding_rows), "problems_attempted": len({row.question_id for row in coding_valid}),
-                "problems_solved": sum(1 for row in coding_best_question.values() if row.passed),
-                "test_cases_passed": coding_tests_passed, "test_cases_total": coding_tests_total,
-                "accuracy": round(sum(row.score_percentage for row in coding_best_question.values()) / len(coding_best_question), 2) if coding_best_question else None,
-                "average_execution_time_ms": round(sum(runtime_rows) / len(runtime_rows), 2) if runtime_rows else None,
-                "completion_time_tracked": False},
-            "project": {"interviews_completed": len(completed_projects), "projects_assessed": len({row.project_key for row in completed_projects}),
-                "questions_answered": project_questions,
-                "technical_score": round(sum(row.final_score for row in project_best.values()) / len(project_best), 2) if project_best else None,
-                "improvement_points": project_trend}},
-        "history": serial_history, "milestones": milestones[-30:],
-        "scoring_policy": "Trend lines carry forward the best score per MCQ level, coding difficulty/topic/level, and project. The overall trend renormalizes configured pipeline weights over pipelines with actual scores. Improvement compares the last two recorded cumulative points."}
-
-
 def leaderboard_rows(pipeline):
     candidates = []
     for user in User.query.filter_by(role="candidate", account_status="active", is_email_verified=True).all():
@@ -1965,7 +1655,7 @@ def create_app(test_config=None):
             db.session.commit()
         try:
             question = _ensure_project_interview_question(interview_session)
-        except (ProjectAIError, ValueError) as exc:
+        except (MCQGenerationError, ValueError) as exc:
             logging.warning("Project interview question generation failed for session %s: %s", interview_session.id, type(exc).__name__)
             return jsonify({"ok": False, "error": "We could not generate the next interview question. Retry when the AI service is available.",
                 "session_id": interview_session.id, "retry": True}), 503
@@ -2007,7 +1697,7 @@ def create_app(test_config=None):
             return jsonify({"ok": True, "completed": True, "report": interview_session.final_report})
         try:
             question = _ensure_project_interview_question(interview_session)
-        except (ProjectAIError, ValueError) as exc:
+        except (MCQGenerationError, ValueError) as exc:
             logging.warning("Project interview continuation failed for session %s: %s", session_id, type(exc).__name__)
             return response_error("The next interview question is not ready. Please retry.", 503)
         return jsonify({"ok": True, "question": _project_interview_question_payload(question),
@@ -2062,7 +1752,7 @@ def create_app(test_config=None):
             try:
                 evaluation = evaluate_project_answer(interview_session.project_context["project"], question,
                     answer.answer_text, _project_interview_history(interview_session))
-            except (ProjectAIError, ValueError) as exc:
+            except (MCQGenerationError, ValueError) as exc:
                 answer.evaluation_status = "failed"
                 answer.evaluation_started_at = None
                 db.session.commit()
@@ -2103,7 +1793,7 @@ def create_app(test_config=None):
                             "report": interview_session.final_report})
         try:
             next_question = _ensure_project_interview_question(interview_session)
-        except (ProjectAIError, ValueError) as exc:
+        except (MCQGenerationError, ValueError) as exc:
             logging.warning("Project interview follow-up generation failed for session %s: %s", session_id, type(exc).__name__)
             return jsonify({"ok": False, "evaluation": evaluation_payload, "completed": False,
                 "next_question_pending": True,
@@ -2483,8 +2173,9 @@ def create_app(test_config=None):
                 content = generate_coding_question(profile, topic, difficulty, level, previous, languages)
             except (CodingQuestionError, MCQGenerationError, RunnerError, ValueError) as exc:
                 status = exc.status if isinstance(exc, RunnerError) else 503
-                logging.warning("Coding question generation failed for candidate %s (%s/%s): %s",
-                                user.id, difficulty, topic[:60], type(exc).__name__)
+                logging.warning("Coding question generation failed for candidate %s (%s/%s): %s (%s)",
+                                user.id, difficulty, topic[:60], type(exc).__name__,
+                                getattr(exc, "reason", str(exc))[:240])
                 return response_error(str(exc), status)
             question = CodingQuestion(user_id=user.id, difficulty=difficulty, topic=topic, level=level, content=content)
             db.session.add(question)
@@ -2520,64 +2211,6 @@ def create_app(test_config=None):
         return jsonify({"ok": True, "question": coding_question_public(question, languages),
                         "progress": {"difficulty": question.difficulty, "topic": question.topic,
                                      "level": question.level, "highest_unlocked_level": progress.highest_unlocked_level}})
-
-    @app.get("/api/coding/question/<int:question_id>/draft")
-    @login_required
-    def get_coding_draft(user, question_id):
-        question = CodingQuestion.query.filter_by(id=question_id, user_id=user.id).first()
-        if not question:
-            return response_error("Coding question not found.", 404)
-        language = request.args.get("language", "")
-        try:
-            languages = candidate_coding_languages(coding_profile(user), configured_languages())
-        except RunnerError as exc:
-            return response_error(str(exc), exc.status)
-        if language not in question.content.get("supported_languages", []) or language not in languages:
-            return response_error("This language is not enabled for your portfolio and this question.", 400)
-        draft = CodingDraft.query.filter_by(user_id=user.id, question_id=question.id, language=language).first()
-        return jsonify({"ok": True, "draft": draft.source_code if draft else None,
-                        "revision": draft.revision if draft else 0,
-                        "updated_at": draft.updated_at.isoformat() if draft else None})
-
-    @app.put("/api/coding/question/<int:question_id>/draft")
-    @login_required
-    @rate_limit("coding-draft-save", 120)
-    @require_csrf
-    def save_coding_draft(user, question_id):
-        question = CodingQuestion.query.filter_by(id=question_id, user_id=user.id).first()
-        if not question:
-            return response_error("Coding question not found.", 404)
-        body = request.get_json(silent=True)
-        if not isinstance(body, dict) or set(body) != {"source_code", "language", "revision"}:
-            return response_error("Submit source_code, language, and revision.", 400)
-        source, language, revision = body["source_code"], body["language"], body["revision"]
-        if not isinstance(source, str) or len(source.encode("utf-8")) > 30_000:
-            return response_error("Code must be text no larger than 30 KB.", 400)
-        if not isinstance(language, str) or type(revision) is not int or revision < 0:
-            return response_error("A supported language and non-negative draft revision are required.", 400)
-        try:
-            languages = candidate_coding_languages(coding_profile(user), configured_languages())
-        except RunnerError as exc:
-            return response_error(str(exc), exc.status)
-        if language not in question.content.get("supported_languages", []) or language not in languages:
-            return response_error("This language is not enabled for your portfolio and this question.", 400)
-        draft = CodingDraft.query.filter_by(user_id=user.id, question_id=question.id, language=language).with_for_update().first()
-        if not draft and revision < 1:
-            return response_error("A new draft must start with revision 1 or later.", 400)
-        if draft and revision < draft.revision:
-            return jsonify({"ok": False, "error": "A newer code draft is already saved.",
-                            "revision": draft.revision}), 409
-        if draft and revision == draft.revision and draft.source_code != source:
-            return jsonify({"ok": False, "error": "A newer code draft is already saved.",
-                            "revision": draft.revision}), 409
-        if not draft:
-            draft = CodingDraft(user_id=user.id, question_id=question.id, language=language)
-            db.session.add(draft)
-        draft.source_code = source
-        draft.revision = revision
-        draft.updated_at = utcnow()
-        db.session.commit()
-        return jsonify({"ok": True, "revision": draft.revision, "updated_at": draft.updated_at.isoformat()})
 
     @app.post("/api/coding/question/<int:question_id>/run")
     @login_required
@@ -2645,7 +2278,7 @@ def create_app(test_config=None):
         hints_used = CodingHint.query.filter_by(user_id=user.id, question_id=question.id).count()
         try:
             evaluation = run_cases(source, language,
-                                   question.content["hidden_test_cases"],
+                                   question.content["public_test_cases"] + question.content["hidden_test_cases"],
                                    include_details=False)
             score = evaluation["score"]
             threshold = coding_pass_percent()
@@ -2734,7 +2367,6 @@ def create_app(test_config=None):
     @login_required
     def performance_overview(user):
         performance = candidate_performance(user)
-        dashboard = performance_dashboard_data(user, performance)
         ranks = {}
         for pipeline in ("mcq", "coding", "project", "overall"):
             score = performance["overall_score"] if pipeline == "overall" else performance["scores"][pipeline]
@@ -2744,7 +2376,7 @@ def create_app(test_config=None):
             else:
                 ranks[pipeline] = None
         performance["pipeline_ranks"] = ranks
-        return jsonify({"ok": True, "performance": performance, "dashboard": dashboard,
+        return jsonify({"ok": True, "performance": performance,
                         "leaderboards": {"mcq": "/api/leaderboard?pipeline=mcq",
                                          "coding": "/api/leaderboard?pipeline=coding",
                                          "project": "/api/leaderboard?pipeline=project",
@@ -2766,7 +2398,6 @@ def create_app(test_config=None):
 
     with app.app_context():
         db.create_all()
-        upgrade_existing_sqlite_schema(db.engine)
     return app
 
 
